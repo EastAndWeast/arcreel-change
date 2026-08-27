@@ -1385,6 +1385,18 @@ PROVIDER_REGISTRY: dict[str, ProviderMeta] = {
                 resolutions=["480p", "720p", "1080p"],
                 pricing=_agnes_video_pricing("agnes-video-v2.0", 0.005),
             ),
+            # agnes-video-2.5-flash：同一 submit/轮询骨架、OpenAI Videos 兼容请求体（seconds 字符串
+            # 4–12s、仅 size=720P、比例经 aspect_ratio、三态 mode）。计费：CN 站点标注原价
+            # ¥0.15/s、当前限时免费，USD 标准价未在官方价目页核实——按 0 建模（仅影响费用展示，
+            # 不影响生成与时长记账），核实后再回填。
+            "agnes-video-2.5-flash": ModelInfo(
+                display_name="Agnes Video 2.5 Flash",
+                media_type="video",
+                capabilities=[],
+                supported_durations=list(range(4, 13)),
+                resolutions=["720p"],
+                pricing=_agnes_video_pricing("agnes-video-2.5-flash", 0.0),
+            ),
         },
         default_base_url=AGNES_BASE_URL,
         # Agnes 视频上游对并发敏感，出厂串行（默认 1）避免主动制造 503 Service busy；

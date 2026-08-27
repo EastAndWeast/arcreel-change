@@ -17,6 +17,12 @@
 
 关键帧 / 多图映射：无图 → 文生视频；起始图 → 顶层 ``image``；首尾帧 → ``extra_body.image=[s,e]``
 + ``mode="keyframes"``；参考图 → ``extra_body.image=[refs]``。单通道 + mode 不叠加。
+
+2.5 Flash 契约（``agnes-video-2.5*``，见 ``_is_flash_model``）：与 v2.0 同一 submit/轮询骨架，
+但请求体走 OpenAI Videos 兼容字段——``seconds``（字符串 4–12）+ ``size="720P"``（唯一档）+
+``aspect_ratio``（文档枚举比例）+ 三态 ``mode``（text / keyframe / reference）；图像字段为
+``first_frame`` / ``last_frame`` / ``images``。注意 2.5 文档的 keyframe 是单数、v2.0 网关的
+keyframes 是复数，两个词各自真实存在于契约，勿「统一」。
 """
 
 from __future__ import annotations
@@ -31,7 +37,12 @@ from urllib.parse import urlsplit
 import httpx
 
 from lib.agnes_shared import agnes_base_url, agnes_headers, agnes_host, resolve_agnes_api_key
-from lib.aspect_size import VIDEO_TIER_SHORT_EDGE, aspect_size, resolution_to_short_edge
+from lib.aspect_size import (
+    VIDEO_TIER_SHORT_EDGE,
+    aspect_size,
+    parse_aspect_ratio,
+    resolution_to_short_edge,
+)
 from lib.db.repositories.usage_repo import MAX_BILLED_DURATION_SECONDS
 from lib.logging_utils import format_kwargs_for_log
 from lib.providers import PROVIDER_AGNES
@@ -97,12 +108,36 @@ _POLL_TIMEOUT_PER_SECOND = 60.0
 
 _KEYFRAMES_MODE = "keyframes"
 
+# ── 2.5 Flash 契约常量 ─────────────────────────────────────────────────
+# 与 registry agnes-video-2.5-flash 的 supported_durations（4..12s）同步；文档 seconds 为
+# 字符串 "4"–"12"。分辨率只有 720P 一档，比例另经 aspect_ratio 下发（文档枚举六档）。
+_FLASH_MODEL_PREFIX = "agnes-video-2.5"
+_FLASH_MIN_DURATION_SECONDS = 4
+_FLASH_MAX_DURATION_SECONDS = 12
+_FLASH_SIZE = "720P"
+_FLASH_TEXT_MODE = "text"
+_FLASH_KEYFRAME_MODE = "keyframe"
+_FLASH_REFERENCE_MODE = "reference"
+_FLASH_ASPECT_RATIOS = ("21:9", "16:9", "4:3", "1:1", "3:4", "9:16")
+
 # 失败终态集合：除文档化的 failed 外，纳入 error / cancelled / canceled，避免上游以非标准失败态
 # 收尾时被当「仍在进行」轮询到超时。
 _FAILED_STATUSES = ("failed", "error", "cancelled", "canceled")
 
-# 进日志的安全标量白名单；image / extra_body 内的 base64 一律不入日志。
-_SAFE_LOG_KEYS = ("model", "height", "width", "num_frames", "frame_rate", "seed")
+# 进日志的安全标量白名单；image / extra_body / first_frame / last_frame / images 内的
+# base64 一律不入日志（后三者不在白名单即天然排除）。
+_SAFE_LOG_KEYS = (
+    "model",
+    "height",
+    "width",
+    "num_frames",
+    "frame_rate",
+    "seed",
+    "seconds",
+    "size",
+    "aspect_ratio",
+    "mode",
+)
 
 # 完成态响应中可能承载成片 URL 的权威字段，按优先级探测（顶层与 metadata 同权，顶层优先）。
 _PRIMARY_URL_FIELDS = ("url", "video_url")
@@ -171,6 +206,35 @@ def _image_to_bare_base64(image_path: Path) -> str:
     仓库通用 data-URI helper（图像端接受 data-URI，视频端不接受，二者不可混用）。
     """
     return base64.b64encode(image_path.read_bytes()).decode("ascii")
+
+
+def _is_flash_model(model: str) -> bool:
+    """是否走 2.5 Flash 契约（``agnes-video-2.5*``，当前注册 2.5-flash）。"""
+    return model.startswith(_FLASH_MODEL_PREFIX)
+
+
+def _snap_flash_aspect_ratio(aspect_ratio: str) -> str:
+    """把请求画幅吸附到 2.5 Flash 文档枚举的合法比例。
+
+    精确命中原样返回；否则取比例值最接近的合法档（并列取像素更多者），并告警——不吸附会被
+    上游 400 直接拒掉，而静默吸附会让用户拿到非项目设定比例的成片，两害取轻且必须留痕。
+    """
+    if aspect_ratio in _FLASH_ASPECT_RATIOS:
+        return aspect_ratio
+    aw, ah = parse_aspect_ratio(aspect_ratio)
+    target = aw / ah
+
+    def _score(ratio: str) -> tuple[float, int]:
+        rw, rh = (int(x) for x in ratio.split(":"))
+        return abs(rw / rh - target), -(rw * rh)
+
+    snapped = min(_FLASH_ASPECT_RATIOS, key=_score)
+    logger.warning(
+        "Agnes 2.5 Flash 不支持画幅 %s，已吸附到 %s（输出非项目设定比例）",
+        aspect_ratio,
+        snapped,
+    )
+    return snapped
 
 
 def _safe_body_for_log(body: dict) -> dict:
@@ -321,8 +385,11 @@ class AgnesVideoBackend(ProviderJobIdPersistenceMixin):
 
         通道优先级（单通道，不叠加）：参考图 → ``extra_body.image=[refs]``；首+尾帧 →
         ``extra_body.image=[s,e]`` + ``mode=keyframes``；仅起始图 → 顶层 ``image``；都无 → 文生视频。
+        2.5 Flash 系（``_is_flash_model``）改走 ``_build_flash_payload``，不进本契约。
         """
         self._reject_out_of_range_duration(request.duration_seconds)
+        if _is_flash_model(self._model):
+            return self._build_flash_payload(request)
         width, height = _resolve_size(request.resolution, request.aspect_ratio)
         payload: dict = {
             "model": self._model,
@@ -368,14 +435,78 @@ class AgnesVideoBackend(ProviderJobIdPersistenceMixin):
 
         return payload
 
+    def _build_flash_payload(self, request: VideoGenerationRequest) -> dict:
+        """构建 2.5 Flash 提交体（seconds / size / aspect_ratio + 三态 mode）。
+
+        通道映射与 v2.0 同语义、字段不同：参考图 → ``mode=reference`` + ``images``；首+尾帧 →
+        ``mode=keyframe`` + ``first_frame``/``last_frame``；仅首帧 → ``mode=keyframe`` +
+        ``first_frame``（文档允许 keyframe 只给首帧）；都无 → ``mode=text``。
+
+        图像编码与 v2.0 一致走裸 base64：2.5 文档要求「公网可访问 URL」，但同网关的 v2.0 端点
+        实测接受裸 base64，2.5 是否同样接受以真实网关为准——若被拒，仅需替换本方法内的
+        ``_encode_*`` 调用点为 URL 通道，v2.0 路径与轮询骨架不受影响。
+        """
+        reference_images = self._valid_paths(request.reference_images)
+        start_image = self._single_path(request.start_image)
+        end_image = self._single_path(request.end_image)
+
+        # 与 v2.0 同一套 fail-loud 通道校验：单通道互斥、尾帧须随首帧、参考图上限。
+        if reference_images and (start_image is not None or end_image is not None):
+            raise VideoCapabilityError("video_reference_images_with_frames_unsupported", model=self._model)
+        if end_image is not None and start_image is None:
+            raise VideoCapabilityError("video_end_image_requires_start_image", model=self._model)
+        if reference_images and len(reference_images) > _MAX_REFERENCE_IMAGES:
+            raise VideoCapabilityError(
+                "video_reference_images_exceeded",
+                model=self._model,
+                count=len(reference_images),
+                limit=_MAX_REFERENCE_IMAGES,
+            )
+
+        if request.resolution and request.resolution.lower() != "720p":
+            # Flash 仅 720P 一档，明确降档告警而非静默忽略用户的清晰度选择。
+            logger.warning("Agnes 2.5 Flash 仅支持 720P，忽略分辨率请求 %s", request.resolution)
+
+        payload: dict = {
+            "model": self._model,
+            "prompt": request.prompt,
+            "seconds": str(request.duration_seconds),
+            "size": _FLASH_SIZE,
+            "aspect_ratio": _snap_flash_aspect_ratio(request.aspect_ratio),
+            "mode": _FLASH_TEXT_MODE,
+        }
+        if request.seed is not None:
+            payload["seed"] = request.seed
+
+        if reference_images:
+            payload["mode"] = _FLASH_REFERENCE_MODE
+            payload["images"] = [self._encode_reference(p) for p in reference_images]
+        elif start_image is not None and end_image is not None:
+            payload["mode"] = _FLASH_KEYFRAME_MODE
+            payload["first_frame"] = self._encode_start(start_image)
+            payload["last_frame"] = self._encode_end(end_image)
+        elif start_image is not None:
+            payload["mode"] = _FLASH_KEYFRAME_MODE
+            payload["first_frame"] = self._encode_start(start_image)
+
+        return payload
+
     def _reject_out_of_range_duration(self, duration_seconds: int) -> None:
-        """时长越界 [_MIN, _MAX] 时 fail-loud；上游若漏校验，避免静默截帧 + 错记计费时长。"""
-        if not _MIN_DURATION_SECONDS <= duration_seconds <= _MAX_DURATION_SECONDS:
+        """时长越界 fail-loud；上游若漏校验，避免静默截帧 + 错记计费时长。
+
+        合法域按 model 分档：2.5 Flash 4–12s（文档 seconds "4"–"12"），其余沿用 1–18s。
+        """
+        lo, hi = (
+            (_FLASH_MIN_DURATION_SECONDS, _FLASH_MAX_DURATION_SECONDS)
+            if _is_flash_model(self._model)
+            else (_MIN_DURATION_SECONDS, _MAX_DURATION_SECONDS)
+        )
+        if not lo <= duration_seconds <= hi:
             raise VideoCapabilityError(
                 "video_duration_not_supported",
                 model=self._model,
                 duration=duration_seconds,
-                supported=f"{_MIN_DURATION_SECONDS}-{_MAX_DURATION_SECONDS}",
+                supported=f"{lo}-{hi}",
             )
 
     @staticmethod
@@ -453,11 +584,12 @@ class AgnesVideoBackend(ProviderJobIdPersistenceMixin):
         """按 ``video_id`` 向成片查询端点二次查询（完成态只含 video_id、无直接 URL 字段时）。
 
         该端点挂在网关根而非 ``/v1`` 下，且只认 video_id——拿 task_id 打它会排队异常。
-        幂等 GET，复用轮询同一套重试判定。
+        必带 ``model_name``：网关文档指明仅用 video_id 查询只适用于 text 模式任务，
+        keyframe / reference 任务的成片查询须与模型名同报。幂等 GET，复用轮询同一套重试判定。
         """
         resp = await client.get(
             f"{self._host}{_VIDEO_QUERY_ENDPOINT}",
-            params={"video_id": video_id},
+            params={"video_id": video_id, "model_name": self._model},
             headers=agnes_headers(self._api_key),
         )
         resp.raise_for_status()

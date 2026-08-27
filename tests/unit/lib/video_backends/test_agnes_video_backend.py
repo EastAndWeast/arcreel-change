@@ -381,6 +381,182 @@ class TestImageChannels:
         assert "extra_body" not in body
 
 
+class TestFlash25:
+    """2.5 Flash 契约：seconds / size / aspect_ratio + 三态 mode，图像字段 first_frame / last_frame / images。"""
+
+    _FLASH_MODEL = "agnes-video-2.5-flash"
+
+    def _backend(self) -> AgnesVideoBackend:
+        return AgnesVideoBackend(api_key="k", base_url=_BASE_URL, model=self._FLASH_MODEL)
+
+    async def test_text_mode_payload_omits_v20_fields(self, tmp_path: Path):
+        with _agnes_api() as routes:
+            routes.submit.mock(return_value=_queued("t-f-text"))
+            routes.poll.mock(return_value=_json(_completed("t-f-text")))
+
+            await self._backend().generate(_request(tmp_path, seed=3, resolution="720p"))
+
+            body = _sent_payload(routes)
+
+        assert body["model"] == self._FLASH_MODEL
+        assert body["prompt"] == "p"
+        assert body["seconds"] == "5"  # 文档契约：seconds 为字符串
+        assert body["size"] == "720P"
+        assert body["aspect_ratio"] == "9:16"
+        assert body["mode"] == "text"
+        assert body["seed"] == 3
+        # v2.0 契约字段与全部图像通道一概不发
+        for key in (
+            "height",
+            "width",
+            "num_frames",
+            "frame_rate",
+            "image",
+            "extra_body",
+            "first_frame",
+            "last_frame",
+            "images",
+        ):
+            assert key not in body
+
+    async def test_keyframe_first_and_last(self, tmp_path: Path):
+        start = _write_image(tmp_path / "s.png", b"start-bytes")
+        end = _write_image(tmp_path / "e.png", b"end-bytes")
+
+        with _agnes_api() as routes:
+            routes.submit.mock(return_value=_queued("t-f-kf"))
+            routes.poll.mock(return_value=_json(_completed("t-f-kf")))
+
+            await self._backend().generate(_request(tmp_path, start_image=start, end_image=end))
+
+            body = _sent_payload(routes)
+
+        assert body["mode"] == "keyframe"  # 2.5 契约为单数，区别于 v2.0 网关的 keyframes
+        assert body["first_frame"] == base64.b64encode(b"start-bytes").decode("ascii")
+        assert body["last_frame"] == base64.b64encode(b"end-bytes").decode("ascii")
+        assert not body["first_frame"].startswith("data:")  # 裸 base64，无 data: 前缀
+        assert "images" not in body
+        assert "image" not in body
+
+    async def test_keyframe_first_only(self, tmp_path: Path):
+        """仅首帧 → keyframe 只带 first_frame（文档允许 keyframe 缺省尾帧）。"""
+        start = _write_image(tmp_path / "s.png", b"solo-start")
+
+        with _agnes_api() as routes:
+            routes.submit.mock(return_value=_queued("t-f-kf1"))
+            routes.poll.mock(return_value=_json(_completed("t-f-kf1")))
+
+            await self._backend().generate(_request(tmp_path, start_image=start))
+
+            body = _sent_payload(routes)
+
+        assert body["mode"] == "keyframe"
+        assert body["first_frame"] == base64.b64encode(b"solo-start").decode("ascii")
+        assert "last_frame" not in body
+
+    async def test_reference_images_mode_and_images(self, tmp_path: Path):
+        ref = _write_image(tmp_path / "r.png", b"ref-bytes")
+
+        with _agnes_api() as routes:
+            routes.submit.mock(return_value=_queued("t-f-ref"))
+            routes.poll.mock(return_value=_json(_completed("t-f-ref")))
+
+            await self._backend().generate(_request(tmp_path, reference_images=[ref]))
+
+            body = _sent_payload(routes)
+
+        assert body["mode"] == "reference"
+        assert body["images"] == [base64.b64encode(b"ref-bytes").decode("ascii")]
+        assert "first_frame" not in body
+
+    async def test_aspect_ratio_snaps_to_documented_ratios(self, tmp_path: Path):
+        """文档枚举外的画幅吸附到比例最近的合法档（2:1 → 16:9）。"""
+        with _agnes_api() as routes:
+            routes.submit.mock(return_value=_queued("t-f-snap"))
+            routes.poll.mock(return_value=_json(_completed("t-f-snap")))
+
+            await self._backend().generate(_request(tmp_path, aspect_ratio="2:1"))
+
+            body = _sent_payload(routes)
+
+        assert body["aspect_ratio"] == "16:9"
+
+    async def test_aspect_ratio_exact_match_passes_through(self, tmp_path: Path):
+        with _agnes_api() as routes:
+            routes.submit.mock(return_value=_queued("t-f-exact"))
+            routes.poll.mock(return_value=_json(_completed("t-f-exact")))
+
+            await self._backend().generate(_request(tmp_path, aspect_ratio="4:3"))
+
+            body = _sent_payload(routes)
+
+        assert body["aspect_ratio"] == "4:3"
+
+    @pytest.mark.parametrize("duration", [3, 13])
+    async def test_out_of_flash_duration_bounds_fails_loud(self, tmp_path: Path, duration: int):
+        """Flash 时长域 4–12s：3s 与 13s 均越界（尽管在 v2.0 域 1–18s 内合法），建单前 fail-loud。"""
+        with _agnes_api() as routes:
+            backend = self._backend()
+            with pytest.raises(VideoCapabilityError) as ei:
+                await backend.generate(_request(tmp_path, duration_seconds=duration))
+
+            assert ei.value.code == "video_duration_not_supported"
+            assert ei.value.params["supported"] == "4-12"
+            assert routes.submit.call_count == 0
+
+    @pytest.mark.parametrize("duration", [4, 12])
+    async def test_flash_duration_bounds_edges_submit(self, tmp_path: Path, duration: int):
+        with _agnes_api() as routes:
+            routes.submit.mock(return_value=_queued("t-f-bound"))
+            routes.poll.mock(return_value=_json(_completed("t-f-bound")))
+
+            await self._backend().generate(_request(tmp_path, duration_seconds=duration))
+
+            body = _sent_payload(routes)
+
+        assert body["seconds"] == str(duration)
+
+    async def test_end_image_only_fails_loud(self, tmp_path: Path):
+        """Flash 分支同样执行通道校验：仅尾帧（无首帧）fail-loud，不静默退化。"""
+        end = _write_image(tmp_path / "e.png", b"end")
+
+        with _agnes_api() as routes:
+            backend = self._backend()
+            with pytest.raises(VideoCapabilityError) as ei:
+                await backend.generate(_request(tmp_path, end_image=end))
+
+            assert ei.value.code == "video_end_image_requires_start_image"
+            assert routes.submit.call_count == 0
+
+    async def test_video_id_query_carries_flash_model_name(self, tmp_path: Path):
+        """二次查询带 model_name=agnes-video-2.5-flash——文档指明仅 video_id 查询只适用 text 任务。"""
+        with _agnes_api(base_url=_GATEWAY_BASE_URL) as routes:
+            routes.submit.mock(return_value=_queued("t-f-q"))
+            routes.poll.mock(
+                return_value=_json(
+                    {
+                        "task_id": "t-f-q",
+                        "video_id": "vid-f",
+                        "status": "completed",
+                        "remixed_from_video_id": None,
+                    }
+                )
+            )
+            routes.query.mock(return_value=_json({"video_id": "vid-f", "url": "https://cdn.agnes/flash.mp4"}))
+            routes.download.mock(return_value=httpx.Response(200, content=b"flash-bytes"))
+
+            backend = AgnesVideoBackend(api_key="k", base_url=_GATEWAY_BASE_URL, model=self._FLASH_MODEL)
+            result = await backend.generate(_request(tmp_path))
+
+            assert (
+                str(only_request(routes.query).url)
+                == "https://apihub.agnes-ai.com/agnesapi?video_id=vid-f&model_name=agnes-video-2.5-flash"
+            )
+
+        assert result.video_uri == "https://cdn.agnes/flash.mp4"
+        assert result.video_path.read_bytes() == b"flash-bytes"
+
+
 class TestFailureAndTimeout:
     async def test_failed_status_raises(self, tmp_path: Path):
         with _agnes_api() as routes:
@@ -443,8 +619,11 @@ class TestFailureAndTimeout:
             backend = AgnesVideoBackend(api_key="k", base_url=_GATEWAY_BASE_URL)
             result = await backend.generate(_request(tmp_path))
 
-            # 二次查询打网关根下的 /agnesapi，按 video_id 传参（不带 /v1，也不用 task_id）
-            assert str(only_request(routes.query).url) == "https://apihub.agnes-ai.com/agnesapi?video_id=vid-123"
+            # 二次查询打网关根下的 /agnesapi，按 video_id + model_name 传参（不带 /v1，也不用 task_id）
+            assert (
+                str(only_request(routes.query).url)
+                == "https://apihub.agnes-ai.com/agnesapi?video_id=vid-123&model_name=agnes-video-v2.0"
+            )
 
         assert result.video_uri == "https://cdn.agnes/queried.mp4"
         assert result.duration_seconds == 8
@@ -684,7 +863,10 @@ class TestResume:
 
             assert routes.submit.call_count == 0
             assert only_request(routes.poll).url.path.endswith("/videos/task-resume-vid")
-            assert str(only_request(routes.query).url) == "https://apihub.agnes-ai.com/agnesapi?video_id=vid-resume"
+            assert (
+                str(only_request(routes.query).url)
+                == "https://apihub.agnes-ai.com/agnesapi?video_id=vid-resume&model_name=agnes-video-v2.0"
+            )
 
         assert result.video_uri == "https://cdn.agnes/resume-queried.mp4"
         assert result.duration_seconds == 8
